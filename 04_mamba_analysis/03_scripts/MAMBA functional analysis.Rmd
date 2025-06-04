@@ -1,0 +1,696 @@
+---
+title: "fluxes yeast mamba"
+author: "joan"
+date: "2025-05-19"
+output: html_document
+---
+
+```{r}
+# ======================================
+# PCA analysis of fluxes
+# ======================================
+
+# Load required libraries
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+
+# Load flux matrix
+fluxes <- read.csv("MAMBA_ll_solution.csv")
+
+# Expand reactions split by "@" into separate rows
+fluxes_expanded <- fluxes %>%
+  separate_rows(Reaction_id, sep = "@")
+
+# Convert to data frame and set reaction names as rownames
+fluxes_df <- as.data.frame(fluxes_expanded)
+rownames(fluxes_df) <- make.unique(fluxes_df$Reaction_id)
+fluxes_df <- fluxes_df[, -1]  # remove Reaction_id column
+
+# Define experimental design
+design <- data.frame(
+  Condition = paste0("Condition", 1:6),
+  Genotype = c("mip6d", "mip6d", "mip6d", "WT", "WT", "WT"),
+  Time = c(0, 20, 120, 0, 20, 120)
+)
+
+# Filter out reactions with zero variance
+row_sds <- apply(fluxes_df, 1, sd)
+fluxes_filtered <- fluxes_df[row_sds > 0, ]
+
+# Perform PCA on transposed matrix (samples in rows)
+PCA_fluxes <- prcomp(t(fluxes_filtered), scale. = TRUE, center = TRUE)
+PCA_df <- as.data.frame(PCA_fluxes$x)
+PCA_df$Genotype <- factor(design$Genotype, levels = c("WT", "mip6d"))
+PCA_df$Time <- as.factor(design$Time)
+
+# Calculate percentage variance explained by PCs
+percentVar <- round(100 * summary(PCA_fluxes)$importance[2, 1:3], 1)
+
+# Plot PC1 vs PC2
+p1 <- ggplot(PCA_df, aes(x = PC1, y = PC2, color = Genotype, shape = Time)) +
+  geom_point(size = 3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  labs(shape = "Time", color = "Genotype") +
+  theme_bw(base_size = 12) +
+  ggtitle("PCA of All Samples (PC1 vs PC2)") +
+  theme(text = element_text(size = 14), axis.text = element_text(size = 14))
+
+ggsave("PCA_fluxes_12.svg", plot = p1, width = 7, height = 5)
+
+# Plot PC1 vs PC3
+p2 <- ggplot(PCA_df, aes(x = PC1, y = PC3, color = Genotype, shape = Time)) +
+  geom_point(size = 3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC3: ", percentVar[3], "% variance")) +
+  labs(shape = "Time", color = "Genotype") +
+  theme_bw(base_size = 12) +
+  ggtitle("PCA of All Samples (PC1 vs PC3)") +
+  theme(text = element_text(size = 14), axis.text = element_text(size = 14))
+
+ggsave("PCA_fluxes_13.svg", plot = p2, width = 7, height = 5)
+
+# Analyze PC3 loadings
+loadings <- PCA_fluxes$rotation
+pc3_contributions <- as.data.frame(loadings[, "PC3", drop = FALSE]) %>%
+  rownames_to_column("Reaction") %>%
+  rename(PC3_loading = PC3) %>%
+  mutate(abs_loading = abs(PC3_loading)) %>%
+  arrange(desc(abs_loading))
+
+# Export top contributing reactions to PC3
+top_pos_pc3 <- pc3_contributions %>% top_n(20, PC3_loading)
+top_neg_pc3 <- pc3_contributions %>% top_n(-20, PC3_loading)
+reacciones_top <- unique(c(top_pos_pc3$Reaction, top_neg_pc3$Reaction))
+write.csv2(reacciones_top, "reacciones_top.csv")
+
+# Plot PC3 loadings
+pc3_contributions %>%
+  top_n(20, abs_loading) %>%
+  ggplot(aes(x = reorder(Reaction, PC3_loading), y = PC3_loading)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  ylab("PC3 loading") +
+  xlab("Reaction") +
+  ggtitle("Top reactions contributing to PC3") +
+  theme_minimal()
+
+# Optional: pathway enrichment analysis of top reactions
+# expanded_rxn_pathways should be loaded beforehand
+expanded_rxn_pathways %>%
+  filter(ReactionID %in% reacciones_top) %>%
+  left_join(pes_df, by = "PathwayID") %>%
+  arrange(desc(PES)) %>%
+  View()
+```
+```{r}
+# ======================================
+# KOALA-based KEGG pathway mapping and PES calculation
+# ======================================
+
+# Load required libraries
+if (!require("openxlsx")) install.packages("openxlsx")
+if (!require("KEGGREST")) BiocManager::install("KEGGREST")
+if (!require("jsonlite")) install.packages("jsonlite")
+if (!require("tidyverse")) install.packages("tidyverse")
+
+library(openxlsx)
+library(KEGGREST)
+library(jsonlite)
+library(tidyverse)
+
+# Load KO annotations from spreadsheet
+ko_data <- read.xlsx("Book4.xlsx")
+ko_list <- unique(na.omit(ko_data$Column3))
+
+# Map KO to KEGG pathways (level: mapXXXXX)
+get_pathways_for_ko <- function(ko) {
+  links <- tryCatch(keggLink("pathway", paste0("ko:", ko)), error = function(e) NULL)
+  if (is.null(links)) return(character(0))
+  paths <- gsub("path:", "", links)
+  paths[grepl("^map", paths)]
+}
+
+ko2pathways <- lapply(ko_list, get_pathways_for_ko)
+names(ko2pathways) <- ko_list
+
+# Flatten into a data frame
+df_ko_map <- enframe(ko2pathways, name = "KO", value = "PathwayID") %>%
+  unnest(PathwayID)
+
+# Convert pathway IDs to S. cerevisiae-specific (sceXXXXX)
+sce_pathways <- keggList("pathway", "sce")
+sce_ids <- gsub("path:", "", names(sce_pathways))
+valid_maps <- gsub("sce", "map", sce_ids)
+
+df_ko_sce <- df_ko_map %>%
+  filter(PathwayID %in% valid_maps) %>%
+  mutate(PathwayID = gsub("map", "sce", PathwayID))
+
+# Load KEGG hierarchy (for pathway nesting)
+kegg_tree <- fromJSON("sce00001.json", simplifyVector = FALSE)
+
+# Recursive function to trace KEGG hierarchy
+find_sce_path <- function(node, target, path = character()) {
+  id <- NA
+  if (str_detect(node$name, "sce\\d{5}")) {
+    id <- str_extract(node$name, "sce\\d{5}")
+  } else if (str_detect(node$name, "\\b091\\d{2}\\b")) {
+    id <- paste0("sce", str_extract(node$name, "\\b091\\d{2}\\b"))
+  }
+  if (!is.na(id)) {
+    path <- c(path, id)
+    if (id == target) return(path)
+  }
+  if (!is.null(node$children)) {
+    for (child in node$children) {
+      result <- find_sce_path(child, target, path)
+      if (!is.null(result)) return(result)
+    }
+  }
+  return(NULL)
+}
+
+# Wrapper to expand hierarchy
+expand_pathways <- function(pathway_id) {
+  result <- find_sce_path(kegg_tree, pathway_id)
+  if (is.null(result)) return(pathway_id) else return(result)
+}
+
+# Expand each KO-pathway to include parent hierarchy
+expanded_ko_pathways <- df_ko_sce %>%
+  rowwise() %>%
+  mutate(AllPathways = list(expand_pathways(PathwayID))) %>%
+  unnest(AllPathways) %>%
+  transmute(KO, PathwayID = AllPathways) %>%
+  distinct()
+
+# Count KOs per pathway and compute PES
+pathway_counts <- expanded_ko_pathways %>%
+  group_by(PathwayID) %>%
+  summarise(UserReactions = n_distinct(KO), .groups = "drop") %>%
+  mutate(MapID = gsub("sce", "map", PathwayID))
+
+# Retrieve total KOs per KEGG map pathway
+get_total_ko_in_path <- function(map_id) {
+  tryCatch({
+    links <- keggLink("ko", paste0("path:", map_id))
+    kos <- gsub("ko:", "", links)
+    length(unique(kos))
+  }, error = function(e) 0)
+}
+
+pathway_counts$TotalKOs <- sapply(pathway_counts$MapID, get_total_ko_in_path)
+
+pes_df <- pathway_counts %>%
+  mutate(PES = 100 * UserReactions / TotalKOs) %>%
+  filter(TotalKOs > 0) %>%
+  arrange(desc(PES))
+
+# Annotate with pathway names
+desc_df <- data.frame(
+  PathwayID = gsub("path:", "", names(sce_pathways)),
+  Description = as.character(sce_pathways),
+  stringsAsFactors = FALSE
+)
+
+pes_annotated <- left_join(pes_df, desc_df, by = "PathwayID") %>%
+  mutate(Description = sub(" - Saccharomyces cerevisiae.*", "", Description))
+
+# Visualise enriched pathways with PES > threshold
+pes_top <- pes_annotated %>% filter(PES > 5800/4854)
+
+ggplot(pes_top, aes(x = reorder(Description, PES), y = PES)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  xlab("Pathway") + ylab("PES (%)") +
+  ggtitle("Pathway Enrichment Score (PES) based on KEGG Orthologs") +
+  theme_classic()
+
+# Export PES results
+write.csv(pes_annotated, "PES_from_KO.csv", row.names = FALSE)
+```
+
+```{r}
+# ======================================
+# Pathway Activity Score (PAS) based on binary activity matrix
+# ======================================
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+library(pheatmap)
+
+# Load binary matrix of reaction activity (1/0)
+reaction_status <- read_csv("MAMBA_reaction_status.csv", show_col_types = FALSE)
+
+# Convert to long format
+reaction_status_long <- reaction_status %>%
+  rename(ReactionID = Gene_id) %>%
+  pivot_longer(-ReactionID, names_to = "Condition", values_to = "Active")
+
+# Load KO-reaction mapping from spreadsheet
+ko_data <- read.xlsx("Book4.xlsx")
+colnames(ko_data)[2:3] <- c("ReactionID", "KO")
+
+# Link each reaction to pathway via KO mapping
+reaction_pathways_expanded <- ko_data %>%
+  filter(!is.na(ReactionID), ReactionID != "", !is.na(KO), KO != "") %>%
+  inner_join(expanded_ko_pathways, by = "KO") %>%
+  select(ReactionID, PathwayID) %>%
+  distinct()
+
+# Combine with activity matrix
+rxn_pathway_activity <- reaction_pathways_expanded %>%
+  inner_join(reaction_status_long, by = "ReactionID")
+
+# Compute PAS = % active reactions per pathway per condition
+pas_df <- rxn_pathway_activity %>%
+  group_by(PathwayID, Condition) %>%
+  summarise(
+    ActiveReactions = sum(Active),
+    TotalReactions = n(),
+    PAS = 100 * ActiveReactions / TotalReactions,
+    .groups = "drop"
+  )
+
+# Add pathway descriptions
+desc_df <- data.frame(
+  PathwayID = gsub("path:", "", names(sce_pathways)),
+  Description = sub(" - Saccharomyces cerevisiae.*", "", as.character(sce_pathways)),
+  stringsAsFactors = FALSE
+)
+pas_df <- left_join(pas_df, desc_df, by = "PathwayID")
+
+# Filter for top PES pathways (from PES block)
+pas_top_df <- pas_df %>%
+  filter(PathwayID %in% pes_top$PathwayID)
+
+# Build PAS matrix for heatmap
+pas_matrix <- pas_top_df %>%
+  select(PathwayID, Condition, PAS) %>%
+  pivot_wider(names_from = Condition, values_from = PAS) %>%
+  column_to_rownames("PathwayID") %>%
+  as.matrix()
+
+# Clean matrix: remove rows with NA/Inf or zero variance
+pas_matrix_clean <- pas_matrix[apply(pas_matrix, 1, function(x) all(is.finite(x)) && sd(x) > 0), ]
+
+# Relabel rows with human-readable names
+desc_lookup <- pas_top_df %>%
+  select(PathwayID, Description) %>%
+  distinct() %>%
+  deframe()
+rownames(pas_matrix_clean) <- desc_lookup[rownames(pas_matrix_clean)]
+
+# Rename columns
+colnames(pas_matrix_clean) <- c("mip6d_0", "mip6d_20", "mip6d_120", "WT_0", "WT_20", "WT_120")
+
+# Plot heatmap
+pheatmap(pas_matrix_clean,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         scale = "row",
+         fontsize_row = 9,
+         fontsize_col = 10,
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         main = "Pathway Activity Score (PAS)")
+```
+
+```{r}
+# ======================================
+# GSVA analysis based on PES-enriched KEGG pathways
+# ======================================
+
+library(GSVA)
+library(readr)
+library(dplyr)
+library(tibble)
+library(KEGGREST)
+library(pheatmap)
+
+# Load normalised expression matrix and metadata
+expr_mat <- read_csv2("normalised_counts.csv") %>%
+  column_to_rownames(var = colnames(.)[1]) %>%
+  as.matrix()
+
+coldata <- read_csv2("coldata.csv") %>%
+  column_to_rownames(var = colnames(.)[1])
+coldata <- coldata[colnames(expr_mat), , drop = FALSE]
+coldata$Time <- as.factor(coldata$Time)
+
+# Use PES-enriched pathways as input
+pes_pathways <- unique(names(rownames(pas_matrix_clean)))
+
+# Retrieve ORF names per pathway from KEGG
+get_genes_for_pathway <- function(pid) {
+  links <- tryCatch(keggLink("sce", paste0("path:", pid)), error = function(e) NULL)
+  if (is.null(links)) return(character(0))
+  genes <- gsub("sce:", "", links)
+  return(genes)
+}
+
+pathway_genes <- lapply(pes_pathways, get_genes_for_pathway)
+names(pathway_genes) <- pes_pathways
+
+# Filter for genes present in the expression matrix
+all_kegg_genes <- unique(unlist(pathway_genes))
+expr_mat_filtered <- expr_mat[rownames(expr_mat) %in% all_kegg_genes, ]
+
+# Build gene sets
+gene_sets <- lapply(pathway_genes, function(genes) intersect(genes, rownames(expr_mat_filtered)))
+gene_sets <- gene_sets[sapply(gene_sets, length) > 0]
+
+# Run GSVA
+params <- gsvaParam(expr_mat_filtered, gene_sets, kcdf = "Gaussian")
+gsva_res <- gsva(params, verbose = TRUE)
+
+# Clean up pathway names
+get_clean_pathway_name <- function(pid) {
+  tryCatch({
+    info <- keggGet(pid)[[1]]
+    name <- info$NAME
+    sub(" - Saccharomyces cerevisiae.*", "", name)
+  }, error = function(e) pid)
+}
+
+pathway_ids <- rownames(gsva_res)
+pathway_names <- sapply(pathway_ids, get_clean_pathway_name)
+rownames(gsva_res) <- pathway_names[pathway_ids]
+
+# Save GSVA scores
+write.csv(gsva_res, "GSVA_scores_PES_KO_pathways_named.csv")
+
+# Plot GSVA heatmap
+tiff("pheatmap_KO_GSVA.tiff", height = 1800, width = 2750, res = 300)
+pheatmap(gsva_res,
+         annotation_col = coldata,
+         show_colnames = FALSE,
+         show_rownames = TRUE,
+         scale = "row",
+         cellheight = 10,
+         cellwidth = 10,
+         main = "GSVA scores")
+dev.off()
+```
+
+```{r}
+# ======================================
+# Fold change analysis of fluxes and volcano plots
+# ======================================
+
+library(tidyverse)
+
+# Define input files and sample metadata
+file_map <- tibble(
+  File = c("MAMBA_flux_condition1.csv", "MAMBA_flux_condition2.csv", "MAMBA_flux_condition3.csv",
+           "MAMBA_flux_condition4.csv", "MAMBA_flux_condition5.csv", "MAMBA_flux_condition6.csv"),
+  Strain = c("mip6d", "mip6d", "mip6d", "WT", "WT", "WT"),
+  Time = c("0", "20", "120", "0", "20", "120")
+)
+
+# Function to expand merged reactions
+expand_reactions <- function(df) {
+  expanded <- list()
+  for (col in colnames(df)) {
+    if (str_detect(col, "@")) {
+      parts <- str_split(col, "@")[[1]]
+      for (p in parts) {
+        expanded[[p]] <- df[[col]]
+      }
+    } else {
+      expanded[[col]] <- df[[col]]
+    }
+  }
+  as_tibble(expanded)
+}
+
+# Load and annotate all replicate files
+all_fluxes <- list()
+for (i in seq_len(nrow(file_map))) {
+  file <- file_map$File[i]
+  strain <- file_map$Strain[i]
+  time <- file_map$Time[i]
+
+  df <- read_csv(file, show_col_types = FALSE)
+  df_expanded <- expand_reactions(df) %>%
+    mutate(Strain = strain, Time = time, Replicate = paste0("R", i))
+
+  all_fluxes[[i]] <- df_expanded
+}
+
+flux_df <- bind_rows(all_fluxes)
+
+# Convert to long format
+flux_long <- flux_df %>%
+  pivot_longer(cols = -c(Strain, Time, Replicate),
+               names_to = "Reaction", values_to = "Flux")
+
+# Global differential flux: WT vs mip6d
+flux_summary <- flux_long %>%
+  group_by(Reaction, Strain) %>%
+  summarise(Fluxes = list(Flux), .groups = "drop") %>%
+  pivot_wider(names_from = Strain, values_from = Fluxes) %>%
+  filter(!is.na(WT), !is.na(mip6d))
+
+epsilon <- 1e-6
+
+results_global <- flux_summary %>%
+  rowwise() %>%
+  mutate(
+    WT_mean = mean(unlist(WT)),
+    mip6_mean = mean(unlist(mip6d)),
+    log2FC = log2((mip6_mean + epsilon) / (WT_mean + epsilon)),
+    p_value = tryCatch(wilcox.test(unlist(WT), unlist(mip6d))$p.value, error = function(e) NA_real_)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    p_value = ifelse(is.na(p_value), 1, p_value),
+    FDR = p.adjust(p_value, method = "BH")
+  ) %>%
+  select(Reaction, WT_mean, mip6_mean, log2FC, p_value, FDR)
+
+write.csv(results_global, "res_global_wilcox_clean.csv", row.names = FALSE)
+results_global %>%
+  filter(FDR < 0.05) %>%
+  write.csv("res_global_wilcox_significant.csv", row.names = FALSE)
+
+# Timepoint-specific fold change and volcano plots
+results_by_time <- list()
+results_sig_by_time <- list()
+
+for (t in unique(flux_long$Time)) {
+  flux_summary_time <- flux_long %>%
+    filter(Time == t) %>%
+    group_by(Reaction, Strain) %>%
+    summarise(Fluxes = list(Flux), .groups = "drop") %>%
+    pivot_wider(names_from = Strain, values_from = Fluxes) %>%
+    filter(!is.na(WT), !is.na(mip6d))
+
+  results_time <- flux_summary_time %>%
+    rowwise() %>%
+    mutate(
+      WT_mean = mean(unlist(WT)),
+      mip6_mean = mean(unlist(mip6d)),
+      log2FC = log2((mip6_mean + epsilon) / (WT_mean + epsilon)),
+      p_value = tryCatch(wilcox.test(unlist(WT), unlist(mip6d))$p.value, error = function(e) 1)
+    ) %>%
+    ungroup() %>%
+    mutate(
+      FDR = p.adjust(p_value, method = "BH"),
+      FDR = ifelse(is.na(FDR), 1, FDR)
+    ) %>%
+    select(Reaction, WT_mean, mip6_mean, log2FC, p_value, FDR)
+
+  results_time_sig <- results_time %>% filter(FDR < 0.05 & abs(log2FC) > 0.58)
+
+  results_by_time[[t]] <- results_time
+  results_sig_by_time[[t]] <- results_time_sig
+
+  write.csv(results_time, paste0("res_time_", t, "_wilcox_clean.csv"), row.names = FALSE)
+  write.csv(results_time_sig, paste0("res_time_", t, "_wilcox_significant.csv"), row.names = FALSE)
+  write.csv(results_time_sig %>% filter(log2FC > 0), paste0("res_time_", t, "_wilcox_upregulated.csv"), row.names = FALSE)
+  write.csv(results_time_sig %>% filter(log2FC < 0), paste0("res_time_", t, "_wilcox_downregulated.csv"), row.names = FALSE)
+
+  cat("Time", t, "summary:\n")
+  cat("  - Total tested:", nrow(results_time), "\n")
+  cat("  - Significant:", nrow(results_time_sig), "\n")
+  cat("    - Upregulated:", nrow(results_time_sig %>% filter(log2FC > 0)), "\n")
+  cat("    - Downregulated:", nrow(results_time_sig %>% filter(log2FC < 0)), "\n\n")
+}
+
+# Volcano plots per timepoint
+library(ggrepel)
+volcano_colors <- c("Significant" = "firebrick", "Not significant" = "gray70")
+
+for (t in names(results_by_time)) {
+  df <- results_by_time[[t]] %>%
+    mutate(
+      negLog10FDR = -log10(FDR),
+      Significance = ifelse(FDR < 0.05 & abs(log2FC) > 0.58, "Significant", "Not significant")
+    )
+
+  top_up <- df %>% filter(Significance == "Significant", log2FC > 0) %>% slice_max(log2FC, n = 15)
+  top_down <- df %>% filter(Significance == "Significant", log2FC < 0) %>% slice_min(log2FC, n = 15)
+  top_labels <- bind_rows(top_up, top_down)
+
+  p <- ggplot(df, aes(x = log2FC, y = negLog10FDR, color = Significance)) +
+    geom_point(alpha = 0.7) +
+    scale_color_manual(values = volcano_colors) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    geom_vline(xintercept = c(-0.58, 0.58), linetype = "dotted") +
+    geom_text_repel(
+      data = top_labels,
+      aes(label = Reaction),
+      size = 3,
+      max.overlaps = Inf,
+      box.padding = 0.4,
+      force = 1.5
+    ) +
+    labs(title = paste("Volcano Plot - Time", t, "min"),
+         x = "log2 Fold Change (mip6d vs WT)",
+         y = "-log10(FDR)") +
+    theme_minimal() +
+    theme(legend.position = "none")
+
+  ggsave(filename = paste0("volcano_time_", t, "_labeled.pdf"), plot = p, width = 6, height = 6)
+}
+```
+
+```{r}
+```{r}
+# ======================================
+# PES from significantly changing reactions (FC-based)
+# ======================================
+
+library(jsonlite)
+library(openxlsx)
+library(KEGGREST)
+library(tidyverse)
+
+# Load KEGG hierarchy and pathway descriptions
+kegg_tree <- fromJSON("sce00001.json", simplifyVector = FALSE)
+sce_pathways <- keggList("pathway", "sce")
+desc_df <- data.frame(
+  PathwayID = gsub("path:", "", names(sce_pathways)),
+  Description = as.character(sce_pathways),
+  stringsAsFactors = FALSE
+)
+
+# Define KEGG hierarchy functions
+find_sce_path <- function(node, target, path = character()) {
+  id <- NA
+  if (str_detect(node$name, "sce\\d{5}")) {
+    id <- str_extract(node$name, "sce\\d{5}")
+  } else if (str_detect(node$name, "\\b091\\d{2}\\b")) {
+    id <- paste0("sce", str_extract(node$name, "\\b091\\d{2}\\b"))
+  }
+  if (!is.na(id)) {
+    path <- c(path, id)
+    if (id == target) return(path)
+  }
+  if (!is.null(node$children)) {
+    for (child in node$children) {
+      result <- find_sce_path(child, target, path)
+      if (!is.null(result)) return(result)
+    }
+  }
+  return(NULL)
+}
+
+expand_pathways <- function(pathway_id) {
+  result <- find_sce_path(kegg_tree, pathway_id)
+  if (is.null(result)) return(pathway_id) else return(result)
+}
+
+get_pathways_for_ko <- function(ko) {
+  links <- tryCatch(keggLink("pathway", paste0("ko:", ko)), error = function(e) NULL)
+  if (is.null(links)) return(character(0))
+  gsub("path:", "", links)[grepl("^map", links)]
+}
+
+get_total_ko_in_path <- function(map_id) {
+  tryCatch({
+    links <- keggLink("ko", paste0("path:", map_id))
+    kos <- gsub("ko:", "", links)
+    length(unique(kos))
+  }, error = function(e) 0)
+}
+
+# Timepoints and directions to iterate
+timepoints <- c(0, 20, 120)
+directions <- c("upregulated", "downregulated")
+
+for (time in timepoints) {
+  for (dir in directions) {
+    file <- paste0("annotated_reactions_", time, "_", dir, "_reaction_gene_ko.tsv")
+    if (!file.exists(file)) {
+      message("File not found: ", file)
+      next
+    }
+
+    df <- read_tsv(file, col_names = c("ReactionID", "Gene", "KO"), col_types = "ccc") %>%
+      filter(!is.na(KO), KO != "")
+    ko_list <- unique(df$KO)
+
+    if (length(ko_list) == 0) {
+      message("No KOs found in ", file)
+      next
+    }
+
+    ko2pathways <- lapply(ko_list, get_pathways_for_ko)
+    names(ko2pathways) <- ko_list
+
+    df_ko_map <- enframe(ko2pathways, name = "KO", value = "PathwayID") %>%
+      unnest(PathwayID)
+
+    valid_maps <- gsub("sce", "map", gsub("path:", "", names(sce_pathways)))
+
+    df_ko_sce <- df_ko_map %>%
+      filter(PathwayID %in% valid_maps) %>%
+      mutate(PathwayID = gsub("map", "sce", PathwayID))
+
+    expanded_ko_pathways <- df_ko_sce %>%
+      rowwise() %>%
+      mutate(AllPathways = list(expand_pathways(PathwayID))) %>%
+      unnest(AllPathways) %>%
+      transmute(KO, PathwayID = AllPathways) %>%
+      distinct()
+
+    pathway_counts <- expanded_ko_pathways %>%
+      group_by(PathwayID) %>%
+      summarise(UserReactions = n_distinct(KO), .groups = "drop") %>%
+      mutate(MapID = gsub("sce", "map", PathwayID))
+
+    pathway_counts$TotalKOs <- sapply(pathway_counts$MapID, get_total_ko_in_path)
+
+    pes_df <- pathway_counts %>%
+      mutate(PES = 100 * UserReactions / TotalKOs) %>%
+      filter(TotalKOs > 0) %>%
+      arrange(desc(PES))
+
+    pes_annotated <- left_join(pes_df, desc_df, by = "PathwayID") %>%
+      mutate(Description = sub(" - Saccharomyces cerevisiae.*", "", Description))
+
+    out_csv <- paste0("PES_time_", time, "_", dir, ".csv")
+    write_csv(pes_annotated, out_csv)
+    message("saved: ", out_csv)
+
+    pes_top <- pes_annotated %>% filter(PES > 10)
+
+    p <- ggplot(pes_top, aes(x = reorder(Description, PES), y = PES)) +
+      geom_bar(stat = "identity") +
+      coord_flip() +
+      xlab("Pathway") + ylab("PES (%)") +
+      ggtitle(paste("PES - Time", time, "-", dir)) +
+      theme_classic()
+
+    plot_file <- paste0("PES_plot_time_", time, "_", dir, ".png")
+    ggsave(plot_file, plot = p, width = 10, height = 6, dpi = 300)
+    message("Plot saved: ", plot_file)
+  }
+}
+```
+
