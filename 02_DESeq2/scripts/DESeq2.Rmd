@@ -1,0 +1,668 @@
+---
+title: "DESeq2 Analysis: WT vs mip6Δ"
+output:
+  pdf_document: default
+  html_document: default
+date: "2024-08-06"
+---
+
+```{r}
+# Load required CRAN and Bioconductor packages, installing if necessary
+required_cran <- c("ggplot2", "pheatmap", "dplyr", "matrixStats", "msigdbr")
+required_bioc <- c(
+  "DESeq2", "tximport", "GenomicFeatures", "AnnotationDbi",
+  "org.Sc.sgd.db", "clusterProfiler", "enrichplot", "EnhancedVolcano",
+  "rrvgo", "GOSemSim", "Glimma"
+)
+
+for (pkg in required_cran) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+for (pkg in required_bioc) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, ask = FALSE)
+  }
+}
+
+```
+
+# 1. Construct Sample Metadata
+```{r}
+# Read the SRA run table and extract relevant columns
+SRA <- read.csv("SraRunTable.csv")
+SRA <- SRA[, c("Run", "genotype", "growth_condition")]
+
+# Define strain and time vectors
+Strain <- SRA$genotype
+Time <- c(
+  0, 0, 20, 120, 0, 120, 120, 20, 20, 120,
+  0, 20, 120, 0, 20, 0, 120, 20, 120, 0,
+  20, 20, 0, 120
+)
+
+# Build colData data frame
+coldata <- data.frame(
+  Strain,
+  Time,
+  Group = factor(paste(Strain, Time, sep = "_"))
+)
+
+# Convert Time and Strain to factors with specified levels
+coldata$Time <- factor(coldata$Time, levels = c("0", "20", "120"))
+coldata$Strain <- factor(coldata$Strain, levels = c("wt", "mip6D"))
+
+# Set reference level for Group (baseline: wt at time 0)
+coldata$Group <- relevel(coldata$Group, ref = "wt_0")
+
+# Assign row names from SRA Run IDs
+rownames(coldata) <- SRA$Run
+
+# Sort by Group to ensure consistent ordering
+coldata <- coldata[order(coldata$Group), ]
+
+# Save the metadata for downstream use
+write.csv2(coldata, "coldata.csv")
+
+```
+
+# 2. Import Kallisto quantifications with tximport
+
+```{r}
+library(GenomicFeatures)
+library(tximport)
+
+# Path to the GTF annotation file
+gtf_file <- "Saccharomyces_cerevisiae.R64-1-1.113.gtf"
+
+# Build a TxDb object from the GTF
+txdb <- makeTxDbFromGFF(gtf_file, format = "gtf")
+
+# Extract transcript-to-gene mapping (tx2gene)
+tx2gene <- AnnotationDbi::select(
+  txdb,
+  keys = keys(txdb, keytype = "TXNAME"),
+  keytype = "TXNAME",
+  columns = "GENEID"
+)
+
+# List of abundance files produced by Kallisto
+files <- file.path("kallisto", rownames(coldata), "abundance.tsv")
+names(files) <- rownames(coldata)
+
+# Import transcript-level quantifications and aggregate to gene-level
+txi <- tximport(files, type = "kallisto", tx2gene = tx2gene)
+
+```
+
+# 3. Run DESeq2
+
+```{r}
+library(DESeq2)
+
+# Create DESeqDataSet from tximport output and sample metadata
+dds <- DESeqDataSetFromTximport(txi, colData = coldata, design = ~ Group)
+
+# Filter out genes with very low counts (sum across all samples < 10)
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+
+# Run the DESeq2 main workflow
+dds <- DESeq(dds)
+
+# Remove the MIP6 gene (YHR015W) if desired (to avoid self-bias)
+dds <- dds[!rownames(dds) %in% "YHR015W", ]
+
+# Extract normalized counts and save to file
+norm_counts <- counts(dds, normalize = TRUE)
+write.csv2(norm_counts, "normalised_counts.csv")
+
+```
+
+# 4. Quality control figures
+
+```{r}
+# Create directory for QC output
+qc_dir <- "rnaseq_pipeline/deseq2_analysis/QC"
+dir.create(qc_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ==== PCA Plot Export ====
+# Manually compute PCA on the assay matrix
+pca_input <- t(assay(rld))
+pca <- prcomp(pca_input, center = TRUE, scale. = FALSE)
+
+# Combine PCA results with metadata
+sample_info <- as.data.frame(colData(rld))
+pca_df <- as.data.frame(pca$x)
+pca_df$Strain <- sample_info$Strain
+pca_df$Time   <- sample_info$Time
+percentVar <- round(100 * (pca$sdev^2 / sum(pca$sdev^2)))
+
+# Plot & save PCA
+pca_plot <- ggplot(pca_df, aes(PC1, PC2, color = Strain, shape = as.factor(Time))) +
+  geom_point(size = 3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  labs(shape = "Time", color = "Strain") +
+  theme_bw(base_size = 12) +
+  ggtitle("PCA of All Samples (PC1 vs PC2)") +
+  theme(text = element_text(size = 14), axis.text = element_text(size = 14))
+
+ggsave(
+  filename = file.path(qc_dir, "PCA_all_samples.svg"),
+  plot = pca_plot,
+  width = 7, height = 5, units = "in"
+)
+
+# ==== Sample-to-Sample Distance Heatmap Export ====
+svg(
+  filename = file.path(qc_dir, "sample_distance_heatmap.svg"),
+  width = 9, height = 7
+)
+pheatmap(
+  sampleDistMatrix,
+  clustering_distance_rows = sampleDists,
+  clustering_distance_cols = sampleDists,
+  main = "Sample-to-Sample Distances",
+  annotation_col = annotation_df,
+  annotation_colors = ann_colors
+)
+dev.off()
+
+# ==== Top 50 Variable Genes Heatmap Export ====
+png(
+  filename = file.path(qc_dir, "top50_variable_genes_heatmap.png"),
+  width = 1000, height = 800
+)
+Heatmap(
+  top_mat,
+  name = "rlog",
+  top_annotation = ha,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  column_title = "Samples",
+  row_title = "Top 50 Variable Genes"
+)
+dev.off()
+
+```
+
+# 5. Define helper functions for Volcano Plots
+```{r}
+library(pheatmap)
+library(clusterProfiler)
+library(msigdbr)
+library(enrichplot)
+library(dplyr)
+library(matrixStats)
+library(org.Sc.sgd.db)
+library(rrvgo)
+library(GOSemSim)
+library(EnhancedVolcano)
+
+# Function to generate an MA plot given DESeq2 results
+plot_MA <- function(res, title = "MA Plot") {
+  res_df <- as.data.frame(res)
+  res_df$log2FoldChange <- as.numeric(res_df$log2FoldChange)
+  res_df$baseMean       <- as.numeric(res_df$baseMean)
+  res_df$padj           <- as.numeric(res_df$padj)
+  res_df$Significance   <- ifelse(res_df$padj < 0.05, "Significant", "Not Significant")
+  
+  ggplot(res_df, aes(x = log10(baseMean + 1), y = log2FoldChange, color = Significance)) +
+    geom_point(alpha = 0.5, size = 1) +
+    scale_color_manual(values = c("Not Significant" = "black", "Significant" = "red")) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "blue") +
+    labs(title = title, x = "log10 Mean Expression", y = "log2 Fold Change") +
+    theme_classic()
+}
+
+# Function to generate a volcano plot using EnhancedVolcano
+plot_volcano <- function(res,
+                         title = "Volcano plot",
+                         pCut = 0.05,
+                         fcCut = 0.58,   # |log2 FC| ≥ 0.58 (~1.5-fold)
+                         nLabel = 30) {  # Number of top genes to label
+  df <- as.data.frame(res)
+  df$ORF <- rownames(df)
+  df$gene <- mapIds(
+    org.Sc.sgd.db,
+    keys = df$ORF,
+    column = "GENENAME",
+    keytype = "ORF",
+    multiVals = "first"
+  )
+  df$gene[is.na(df$gene)] <- df$ORF[is.na(df$gene)]
+  
+  # Select top candidates to label
+  label_candidates <- df %>%
+    filter(padj < pCut, abs(log2FoldChange) > fcCut) %>%
+    arrange(padj, desc(abs(log2FoldChange))) %>%
+    slice_head(n = nLabel) %>%
+    pull(gene)
+  
+  EnhancedVolcano(
+    df,
+    x = "log2FoldChange",
+    y = "padj",
+    lab = df$gene,
+    selectLab = label_candidates,
+    pCutoff = pCut,
+    FCcutoff = fcCut,
+    title = title,
+    subtitle = NULL,
+    col = c("grey70", "#4575b4", "#d73027", "black"),
+    colAlpha = 0.5,
+    labSize = 4,
+    pointSize = 2,
+    drawConnectors = TRUE,
+    boxedLabels = TRUE,
+    xlim = c(-5, 5),
+    ylim = c(0, 10)
+  ) +
+    theme_classic(base_size = 12) +
+    theme(axis.text = element_text(size = 14))
+}
+
+# Function to perform KEGG GSEA given a named numeric vector of fold changes
+GSEA_kegg <- function(gene_list) {
+  ego <- gseKEGG(
+    geneList = gene_list,
+    organism = "sce"
+  )
+  res <- ego@result
+  res$Description <- sub(" - .*", "", res$Description)
+  ego@result <- res
+  return(ego)
+}
+
+```
+
+# 6. DE analysis and Functional Enrichment
+
+```{r}
+run_deseq_analysis <- function(comparison_id, comparison_title, contrast_vector) {
+  # Create output directory for this comparison
+  comp_dir <- file.path("rnaseq_pipeline/deseq2_analysis/comparisons", comparison_id)
+  dir.create(comp_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  # Compute DESeq2 results for the specified contrast
+  res <- results(dds, contrast = contrast_vector)
+  assign(paste0("res_", comparison_id), res, envir = .GlobalEnv)
+  
+  # Save all results and significant DEGs (FDR < 0.05, |log2 FC| > 0.58)
+  write.csv(as.data.frame(res), file = file.path(comp_dir, "deg_all.csv"))
+  write.csv(
+    subset(res, padj < 0.05 & abs(log2FoldChange) > 0.58),
+    file = file.path(comp_dir, "deg_significant.csv")
+  )
+  
+  # Generate and save MA plot
+  ma_plot <- plot_MA(res) + ggtitle(paste("MA Plot:", comparison_title))
+  ggsave(file.path(comp_dir, "MA_plot.png"), ma_plot, width = 6, height = 5)
+  
+  # Generate and save volcano plot
+  volcano_plot <- plot_volcano(res, paste("Volcano Plot:", comparison_title))
+  ggsave(file.path(comp_dir, "volcano_plot.png"), volcano_plot, width = 6, height = 5)
+  
+  # Prepare a named vector of log2 fold changes for GSEA
+  res_ordered <- res[order(res$log2FoldChange, decreasing = TRUE), ]
+  gene_list <- res_ordered$log2FoldChange
+  names(gene_list) <- rownames(res_ordered)
+  gene_list <- na.omit(gene_list)
+  
+  # Perform GO GSEA (Biological Process)
+  ego <- gseGO(
+    geneList = gene_list,
+    OrgDb = org.Sc.sgd.db,
+    keyType = "ORF",
+    ont = "BP",
+    minGSSize = 10,
+    maxGSSize = 500,
+    pvalueCutoff = 0.05,
+    verbose = FALSE
+  )
+  
+  ggsave(
+    file.path(comp_dir, "GO_dotplot.svg"),
+    dotplot(ego, showCategory = 8) +
+      ggtitle(paste("GO Dotplot:", comparison_title)) +
+      theme(text = element_text(size = 11)),
+    width = 7, height = 7
+  )
+  
+  ggsave(
+    file.path(comp_dir, "GO_ridgeplot.svg"),
+    ridgeplot(ego, showCategory = 8) +
+      ggtitle(paste("GO Ridgeplot:", comparison_title)) +
+      theme(text = element_text(size = 11)),
+    width = 7, height = 7
+  )
+  
+  # Simplify GO terms with rrvgo
+  simMatrix <- calculateSimMatrix(
+    ego@result$ID,
+    orgdb = "org.Sc.sgd.db",
+    ont = "BP",
+    method = "Rel"
+  )
+  scores <- setNames(-log10(ego@result$p.adjust), ego@result$ID)
+  reducedTerms <- reduceSimMatrix(
+    simMatrix,
+    scores = scores,
+    threshold = 0.7,
+    orgdb = "org.Sc.sgd.db"
+  )
+  
+  png(file.path(comp_dir, "rrvgo_heatmap.png"), width = 900, height = 700)
+  heatmapPlot(simMatrix, reducedTerms, annotateParent = TRUE, annotationLabel = "parentTerm", fontsize = 6)
+  dev.off()
+  
+  png(file.path(comp_dir, "rrvgo_scatter.png"), width = 900, height = 700)
+  scatterPlot(simMatrix, reducedTerms)
+  dev.off()
+  
+  png(file.path(comp_dir, "rrvgo_treemap.png"), width = 900, height = 700)
+  treemapPlot(reducedTerms)
+  dev.off()
+  
+  # Perform KEGG GSEA
+  gKEGG <- GSEA_kegg(gene_list)
+  
+  ggsave(
+    file.path(comp_dir, "KEGG_ridgeplot.png"),
+    ridgeplot(gKEGG, showCategory = 10) +
+      ggtitle(paste("KEGG Ridgeplot:", comparison_title)) +
+      theme(text = element_text(size = 11)),
+    width = 7, height = 5
+  )
+  
+  ggsave(
+    file.path(comp_dir, "KEGG_dotplot.png"),
+    dotplot(gKEGG, showCategory = 10) +
+      ggtitle(paste("KEGG Dotplot:", comparison_title)) +
+      theme(text = element_text(size = 11)),
+    width = 7, height = 5
+  )
+  
+  png(file.path(comp_dir, "KEGG_upsetplot.png"), width = 900, height = 700)
+  p <- upsetplot(gKEGG) + ggtitle(paste("KEGG UpSet Plot:", comparison_title))
+  print(p)
+  dev.off()
+}
+
+# Run all specified contrasts
+run_deseq_analysis("mip6D_0_vs_wt_0",    "mip6Δ vs WT at 0 min",   c("Group", "mip6D_0", "wt_0"))
+run_deseq_analysis("mip6D_20_vs_wt_20",  "mip6Δ vs WT at 20 min",  c("Group", "mip6D_20", "wt_20"))
+run_deseq_analysis("mip6D_120_vs_wt_120","mip6Δ vs WT at 120 min", c("Group", "mip6D_120", "wt_120"))
+
+run_deseq_analysis("mip6D_20_vs_0",      "mip6Δ 20 min vs 0 min",  c("Group", "mip6D_20", "mip6D_0"))
+run_deseq_analysis("mip6D_120_vs_20",    "mip6Δ 120 min vs 20 min",c("Group", "mip6D_120", "mip6D_20"))
+
+run_deseq_analysis("WT_20_vs_0",         "WT 20 min vs 0 min",     c("Group", "wt_20", "wt_0"))
+run_deseq_analysis("WT_120_vs_20",       "WT 120 min vs 20 min",   c("Group", "wt_120", "wt_20"))
+
+```
+
+# 7. Additional volcno plots
+
+```{r}
+# Example: volcano plot for mip6Δ vs WT at 0 min (baseline)
+plot_volcano(res_mip6D_0_vs_wt_0, "mip6Δ vs WT – 0 min (baseline)") +
+  theme(legend.position = "bottom")
+ggsave(
+  filename = "volcano_mip6_vs_WT_0min.svg",
+  width = 6, height = 4, units = "in", bg = "white"
+)
+
+# Volcano plot for mip6Δ vs WT at 20 min (heat shock)
+plot_volcano(res_mip6D_20_vs_wt_20, "mip6Δ vs WT – 20 min (heat shock)") +
+  theme(legend.position = "none")
+ggsave(
+  filename = "volcano_mip6_vs_WT_20min.svg",
+  width = 4, height = 4, units = "in", bg = "white"
+)
+
+# Volcano plot for mip6Δ vs WT at 120 min (recovery)
+plot_volcano(res_mip6D_120_vs_wt_120, "mip6Δ vs WT – 120 min (recovery)") +
+  theme(legend.position = "none")
+ggsave(
+  filename = "volcano_mip6_vs_WT_120min.svg",
+  width = 4, height = 4, units = "in", bg = "white"
+)
+
+```
+
+# 8. Venn diagrams for overlaps 0 - 20
+
+```{r}
+library(ggVennDiagram)
+
+# Identify genes up- or down-regulated in WT (20 vs 0) and mip6Δ (20 vs 0)
+up_wt   <- rownames(res_WT_20_vs_0)[res_WT_20_vs_0$log2FoldChange > 1 & res_WT_20_vs_0$padj < 0.05]
+down_wt <- rownames(res_WT_20_vs_0)[res_WT_20_vs_0$log2FoldChange < -1 & res_WT_20_vs_0$padj < 0.05]
+
+up_mip6   <- rownames(res_mip6D_20_vs_0)[res_mip6D_20_vs_0$log2FoldChange > 1 & res_mip6D_20_vs_0$padj < 0.05]
+down_mip6 <- rownames(res_mip6D_20_vs_0)[res_mip6D_20_vs_0$log2FoldChange < -1 & res_mip6D_20_vs_0$padj < 0.05]
+
+venn_data <- list(
+  "WT up"     = up_wt,
+  "WT down"   = down_wt,
+  "mip6Δ up"  = up_mip6,
+  "mip6Δ down"= down_mip6
+)
+
+# Plot Venn diagram of DEG overlaps
+ggVennDiagram(venn_data, label_alpha = 0, label = "count") +
+  scale_fill_gradient(low = "#F4FAFE", high = "#4981BF") +
+  ggtitle("Venn Diagram: DEGs (0 → 20 min)")
+library(clusterProfiler)
+library(org.Sc.sgd.db)
+library(enrichplot)
+library(dplyr)
+library(patchwork)
+
+# Set thresholds for DEG selection
+cutP  <- 0.05
+cutFC <- 0.58  # |log2 FC| ≥ 0.58 (~1.5-fold)
+
+# Define DEG sets for WT-only and mip6Δ-only
+up_wt   <- rownames(res_WT_20_vs_0)[res_WT_20_vs_0$padj < cutP & res_WT_20_vs_0$log2FoldChange > cutFC]
+down_wt <- rownames(res_WT_20_vs_0)[res_WT_20_vs_0$padj < cutP & res_WT_20_vs_0$log2FoldChange < -cutFC]
+
+up_mip6   <- rownames(res_mip6D_20_vs_0)[res_mip6D_20_vs_0$padj < cutP & res_mip6D_20_vs_0$log2FoldChange > cutFC]
+down_mip6 <- rownames(res_mip6D_20_vs_0)[res_mip6D_20_vs_0$padj < cutP & res_mip6D_20_vs_0$log2FoldChange < -cutFC]
+
+sets <- list(
+  "WT-only up"       = setdiff(up_wt, up_mip6),
+  "mip6Δ-only up"    = setdiff(up_mip6, up_wt),
+  "WT-only down"     = setdiff(down_wt, down_mip6),
+  "mip6Δ-only down"  = setdiff(down_mip6, down_wt)
+)
+
+# Universe of all tested genes (drop NAs in padj)
+universe <- rownames(res_WT_20_vs_0)[!is.na(res_WT_20_vs_0$padj)]
+
+# Perform GO Over-Representation Analysis (ORA) for each subset
+ora_list <- lapply(names(sets), function(n) {
+  enrichGO(
+    gene = sets[[n]],
+    universe = universe,
+    OrgDb = org.Sc.sgd.db,
+    keyType = "ORF",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    qvalueCutoff = 0.05
+  ) |>
+    simplify(cutoff = 0.7, by = "p.adjust", select_fun = min)
+})
+names(ora_list) <- names(sets)
+
+# Extract global maxima/minima for consistent plotting
+all_df <- do.call(rbind, lapply(ora_list, as.data.frame))
+max_enrichment <- max(all_df$FoldEnrichment, na.rm = TRUE)
+max_count <- max(all_df$Count, na.rm = TRUE)
+min_padj <- min(all_df$p.adjust, na.rm = TRUE)
+max_padj <- max(all_df$p.adjust, na.rm = TRUE)
+
+# Generate dotplots for each subset
+plots <- lapply(seq_along(ora_list), function(i) {
+  df <- as.data.frame(ora_list[[i]])
+  top_df <- df[order(df$FoldEnrichment, decreasing = TRUE), ][1:min(10, nrow(df)), ]
+  
+  ggplot(top_df, aes(x = FoldEnrichment, y = reorder(Description, FoldEnrichment))) +
+    geom_point(aes(size = Count, color = p.adjust)) +
+    scale_size(range = c(3, 8), limits = c(0, max_count), name = "Gene Count") +
+    scale_color_viridis_c(
+      option = "D", direction = -1,
+      limits = c(min_padj, max_padj), name = "Adjusted p-value"
+    ) +
+    xlim(0, max_enrichment * 1.1) +
+    labs(title = names(ora_list)[i], x = "Fold Enrichment", y = NULL) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      legend.position = "right",
+      text = element_text(size = 20)
+    )
+})
+
+# Combine and save ORA figure
+fig_ora <- wrap_plots(plots, ncol = 2, guides = "collect") +
+  plot_annotation(title = "GO-BP Enrichment of Strain-Specific DEGs (0 → 20 min)")
+ggsave(
+  filename = "ORA_0_20_subsets.svg",
+  plot = fig_ora,
+  width = 25, height = 8, units = "in", bg = "white"
+)
+```
+
+# Do the same fot the 20 - 120 transition
+
+```{r}
+library(clusterProfiler)
+library(org.Sc.sgd.db)
+library(enrichplot)
+library(dplyr)
+library(patchwork)
+
+# Define DEG sets for WT and mip6Δ (20 → 120 min)
+up_wt   <- rownames(res_WT_120_vs_20)[res_WT_120_vs_20$padj < cutP & res_WT_120_vs_20$log2FoldChange > cutFC]
+down_wt <- rownames(res_WT_120_vs_20)[res_WT_120_vs_20$padj < cutP & res_WT_120_vs_20$log2FoldChange < -cutFC]
+
+up_mip6   <- rownames(res_mip6D_120_vs_20)[res_mip6D_120_vs_20$padj < cutP & res_mip6D_120_vs_20$log2FoldChange > cutFC]
+down_mip6 <- rownames(res_mip6D_120_vs_20)[res_mip6D_120_vs_20$padj < cutP & res_mip6D_120_vs_20$log2FoldChange < -cutFC]
+
+sets <- list(
+  "WT-only up"       = setdiff(up_wt, up_mip6),
+  "mip6Δ-only up"    = setdiff(up_mip6, up_wt),
+  "WT-only down"     = setdiff(down_wt, down_mip6),
+  "mip6Δ-only down"  = setdiff(down_mip6, down_wt)
+)
+
+# Universe of all tested genes (drop NAs in padj)
+universe <- rownames(res_WT_120_vs_20)[!is.na(res_WT_120_vs_20$padj)]
+
+# Perform GO ORA for each subset
+ora_list2 <- lapply(names(sets), function(n) {
+  enrichGO(
+    gene = sets[[n]],
+    universe = universe,
+    OrgDb = org.Sc.sgd.db,
+    keyType = "ORF",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    qvalueCutoff = 0.05
+  ) |>
+    simplify(cutoff = 0.7, by = "p.adjust", select_fun = min)
+})
+names(ora_list2) <- names(sets)
+
+# Extract global maxima/minima for consistent plotting
+all_df2 <- do.call(rbind, lapply(ora_list2, as.data.frame))
+max_enrichment2 <- max(all_df2$FoldEnrichment, na.rm = TRUE)
+max_count2 <- max(all_df2$Count, na.rm = TRUE)
+min_padj2 <- min(all_df2$p.adjust, na.rm = TRUE)
+max_padj2 <- max(all_df2$p.adjust, na.rm = TRUE)
+
+# Generate dotplots for each subset (20 → 120 min)
+plots2 <- lapply(seq_along(ora_list2), function(i) {
+  df <- as.data.frame(ora_list2[[i]])
+  top_df <- df[order(df$FoldEnrichment, decreasing = TRUE), ][1:min(10, nrow(df)), ]
+  
+  ggplot(top_df, aes(x = FoldEnrichment, y = reorder(Description, FoldEnrichment))) +
+    geom_point(aes(size = Count, color = p.adjust)) +
+    scale_size(range = c(3, 8), limits = c(0, max_count2), name = "Gene Count") +
+    scale_color_viridis_c(
+      option = "D", direction = -1,
+      limits = c(min_padj2, max_padj2), name = "Adjusted p-value"
+    ) +
+    xlim(0, max_enrichment2 * 1.1) +
+    labs(title = names(ora_list2)[i], x = "Fold Enrichment", y = NULL) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      legend.position = "right",
+      text = element_text(size = 20)
+    )
+})
+
+# Combine and save ORA figure for 20 → 120 min
+fig_ora2 <- wrap_plots(plots2, ncol = 2, guides = "collect") +
+  plot_annotation(title = "GO-BP Enrichment of Strain-Specific DEGs (20 → 120 min)")
+ggsave(
+  filename = "ORA_20_120_subsets.svg",
+  plot = fig_ora2,
+  width = 18, height = 8, units = "in", bg = "white"
+)
+
+```
+
+# 10. Matrix for MAMBApy
+
+```{r}
+# Combine log2 fold changes and adjusted p-values for all contrasts
+output <- cbind(
+  res_mip6D_20_vs_0$log2FoldChange,    res_mip6D_20_vs_0$padj,
+  res_mip6D_120_vs_20$log2FoldChange,  res_mip6D_120_vs_20$padj,
+  res_WT_20_vs_0$log2FoldChange,       res_WT_20_vs_0$padj,
+  res_WT_120_vs_20$log2FoldChange,     res_WT_120_vs_20$padj,
+  res_mip6D_0_vs_wt_0$log2FoldChange,   res_mip6D_0_vs_wt_0$padj,
+  res_mip6D_20_vs_wt_20$log2FoldChange, res_mip6D_20_vs_wt_20$padj,
+  res_mip6D_120_vs_wt_120$log2FoldChange, res_mip6D_120_vs_wt_120$padj
+)
+
+# Assign row names and column names
+rownames(output) <- rownames(res_WT_20_vs_0)
+colnames(output) <- c(
+  "mip6_20_vs_0_logFC",    "mip6_20_vs_0_padj",
+  "mip6_120_vs_20_logFC",  "mip6_120_vs_20_padj",
+  "WT_20_vs_0_logFC",      "WT_20_vs_0_padj",
+  "WT_120_vs_20_logFC",    "WT_120_vs_20_padj",
+  "0_mip6d_vs_WT_logFC",   "0_mip6d_vs_WT_padj",
+  "20_mip6d_vs_WT_logFC",  "20_mip6d_vs_WT_padj",
+  "120_mip6d_vs_WT_logFC", "120_mip6d_vs_WT_padj"
+)
+
+# Save the combined DEG matrix to file
+write.csv(output, file = "rnaseq_pipeline/deseq2_analysis/DEG_matrix_all_contrasts.csv")
+
+# Example of constructing a placeholder matrix model (for downstream use)
+matrix_model <- matrix(
+  c(0, 1, 0, 0, 0, 0,
+    0, 0, 2, 0, 0, 0,
+    0, 0, 0, 0, 0, 0,
+    5, 0, 0, 0, 3, 0,
+    0, 6, 0, 0, 0, 4,
+    0, 0, 7, 0, 0, 0),
+  nrow = 6, ncol = 6, byrow = TRUE
+)
+colnames(matrix_model) <- c("mip6_0", "mip6_20", "mip6_120", "wt_0", "wt_20", "wt_120")
+rownames(matrix_model) <- colnames(matrix_model)
+
+```
+
