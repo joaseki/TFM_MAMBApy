@@ -1,0 +1,179 @@
+---
+title: "Benchmarking"
+author: "joan"
+date: "2025-05-29"
+output: html_document
+---
+
+```{r}
+# === Load required libraries ===
+library(ggplot2)         # For plotting
+library(RColorConesa)    # Custom color palettes (specific to your theme)
+library(cowplot)         # Plot composition
+library(reshape2)        # Data reshaping (may be redundant with tidyr)
+library(DOYPAColors)     # Additional custom colors (likely project-specific)
+library(dplyr)           # Data manipulation
+library(tidyr)           # Data reshaping and tidying
+library(tibble)          # Enhanced data frames
+
+# === Define a custom ggplot2 theme for publication-quality plots ===
+ale_theme <- theme_bw() + 
+  theme(
+    legend.text = element_text(size = 18),
+    axis.title = element_text(size = 18),
+    legend.title = element_text(size = 18), 
+    axis.text = element_text(size = 16),
+    strip.text = element_text(size = 16),
+    plot.title = element_text(hjust = 0.5, size = 20)
+  )
+
+# === Auxiliary Functions ===
+
+# This function subtracts flux values of reversible reactions (ending in "_rev") 
+# from the forward direction to produce a net flux matrix
+convert2reversible <- function(mamba_res){
+  for (i in rownames(mamba_res)) {
+    if (!grepl("_rev", i)) {
+      rev_name <- paste0(i, "_rev")
+      if (rev_name %in% rownames(mamba_res)) {
+        mamba_res[i,] <- mamba_res[i,] - mamba_res[rev_name,]
+      }
+    }
+  }
+  mamba_res[!grepl("_rev", rownames(mamba_res)),]
+}
+
+# This function splits reactions that are represented as combinations (joined with "@")
+# and assigns "_rev" suffix to second or later instances
+split_rows_with_rownames <- function(df) {
+  df %>%
+    rownames_to_column("Reaction_id") %>%
+    mutate(Reaction_id = strsplit(as.character(Reaction_id), "@")) %>%
+    unnest(Reaction_id) %>%
+    group_by(Reaction_id) %>%
+    mutate(Reaction_id = ifelse(row_number() > 1, paste0(Reaction_id, "_rev"), Reaction_id)) %>%
+    ungroup() %>%
+    column_to_rownames("Reaction_id")
+}
+
+# Loads MAMBA output files matching a pattern (e.g. MAMBA, imat, gimme) from a folder,
+# processes them into a single matrix, removes "sink" reactions, and handles reversibility
+read_mamba <- function(file_dir, pattern) {
+  files <- list.files(path = file_dir, pattern = pattern, full.names = TRUE)
+  tmp_list <- list()
+
+  for (csv in files) {
+    df <- read.csv(csv, row.names = 1, check.names = FALSE)
+    flujo <- df[, ncol(df), drop = FALSE]  # take only the last column
+    flujo <- flujo[!grepl("sink", rownames(flujo)), , drop = FALSE]
+    flujo <- split_rows_with_rownames(flujo)
+    sample <- sub(paste0("_", pattern, ".*"), "", basename(csv))
+    tmp_list[[sample]] <- flujo
+  }
+
+  # Fill missing reactions with 0 for consistency
+  all_rxns <- unique(unlist(lapply(tmp_list, rownames)))
+  tmp_list_filled <- lapply(tmp_list, function(x) {
+    miss <- setdiff(all_rxns, rownames(x))
+    if (length(miss) > 0) x[miss, 1] <- 0
+    x[all_rxns, , drop = FALSE]
+  })
+
+  final_df <- do.call(cbind, tmp_list_filled)
+  colnames(final_df) <- sub("no_intakes", "", names(tmp_list))
+  convert2reversible(final_df)
+}
+
+# Combines multiple reactions (e.g. "A+B") into a single reaction row by summing their fluxes
+combine_reactions <- function(ref_df, new_df){
+  reactions2merge <- rownames(ref_df)[grepl("\\+", rownames(ref_df))]
+  reactions2merge <- strsplit(reactions2merge, split = "\\+")
+  for (reaction in reactions2merge){
+    new_df[paste0(reaction, collapse = "+"),] <- colSums(new_df[reaction,])
+    new_df <- new_df[!(rownames(new_df) %in% reaction), ]
+  }
+  return(new_df)
+}
+
+# === Main benchmarking loop across datasets and conditions ===
+
+datasets <- c("gerosa", "holm", "ishii")
+intake_conditions <- c("with_intakes", "wo_intakes")
+methods <- c("MAMBA", "iMAT", "GIMME")
+
+for (dataset in datasets) {
+  res_all <- data.frame()  # store results for all comparisons
+  
+  for (intake in intake_conditions) {
+    message(paste("Processing:", dataset, intake))
+    
+    path <- file.path(dataset, intake)
+    measured_path <- file.path(path, "measured.csv")
+    
+    if (!file.exists(measured_path)) {
+      warning(paste("Missing file:", measured_path))
+      next
+    }
+
+    # Read measured reference fluxes
+    measured <- read.csv(measured_path, row.names = 1)
+    
+    # Read predicted fluxes for each method
+    mamba <- combine_reactions(measured, read_mamba(path, "MAMBA"))
+    imat  <- combine_reactions(measured, read_mamba(path, "imat"))
+    gimme <- combine_reactions(measured, read_mamba(path, "gimme"))
+    
+    # Align matrices to the same reactions and conditions
+    l_res <- list(MAMBA = mamba, iMAT = imat, GIMME = gimme, Measured = measured)
+    conditions <- colnames(mamba)
+    reactions <- rownames(measured)
+    
+    for (name in names(l_res)) {
+      l_res[[name]] <- l_res[[name]][reactions, conditions]
+    }
+    
+    # Compute metrics (relative error and correlation) for each method and condition
+    for (method in methods) {
+      for (cond in conditions) {
+        pred <- l_res[[method]][, cond]
+        obs  <- l_res[["Measured"]][, cond]
+        error <- norm(pred - obs, "2") / norm(obs, "2")
+        cor_val <- cor(pred, obs)
+        
+        res_all <- rbind(res_all, data.frame(
+          Dataset = dataset,
+          Intake = intake,
+          Method = method,
+          Condition = cond,
+          Error = error,
+          Correlation = cor_val
+        ))
+      }
+    }
+  }
+
+  # === Visualisation ===
+  res_all$Intake <- factor(res_all$Intake, levels = c("wo_intakes", "with_intakes"))
+  res_all$Method <- factor(res_all$Method, levels = methods)
+  
+  p1 <- ggplot(res_all, aes(x = Method, y = Error, fill = Intake)) +
+    geom_boxplot(position = position_dodge(width = 0.8)) +
+    ale_theme + ggtitle(paste("Relative Error -", dataset)) +
+    ylab("Relative Error") +
+    theme(axis.title.x = element_blank())
+  
+  p2 <- ggplot(res_all, aes(x = Method, y = Correlation, fill = Intake)) +
+    geom_boxplot(position = position_dodge(width = 0.8)) +
+    ale_theme + ggtitle(paste("Correlation -", dataset)) +
+    ylab("Pearson correlation") +
+    theme(axis.title.x = element_blank()) +
+    ylim(0, 1)
+  
+  ggsave(paste0("plots/error_boxplot_", dataset, ".png"), p1, width = 7, height = 5)
+  ggsave(paste0("plots/correlation_boxplot_", dataset, ".png"), p2, width = 7, height = 5)
+  
+  print(p1)
+  print(p2)
+}
+```
+
