@@ -1,0 +1,3 @@
+[2025-03-19 21:45:12,300] multiqc.core.file_search                           [INFO   ]  Search path: /storage/gge/Joan/fastq_memoria/fastqc_reports
+[2025-03-19 21:45:13,579] multiqc.modules.fastqc.fastqc                      [INFO   ]  Found 48 reports
+[2025-03-19 21:45:15,191] multiqc.core.write_results                         [INFO   ]  Existing reports found, adding suffix to filenames. Use '--force' to overwrite.

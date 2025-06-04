@@ -1,0 +1,13 @@
+{
+	"n_targets": 6612,
+	"n_bootstraps": 0,
+	"n_processed": 31548429,
+	"n_pseudoaligned": 24757318,
+	"n_unique": 23134617,
+	"p_pseudoaligned": 78.5,
+	"p_unique": 73.3,
+	"kallisto_version": "0.48.0",
+	"index_version": 10,
+	"start_time": "Wed Mar 12 00:37:42 2025",
+	"call": "/storage/gge/Joan/bin/kallisto quant --index /storage/gge/Joan/fastq_memoria/Transcriptome/Saccharomyces_cerevisiae.idx --threads 8 --output-dir /storage/gge/Joan/fastq_memoria/kallisto_quant/SRR9929281 /storage/gge/Joan/fastq_memoria/trimmed_reads/SRR9929281_1.fastq.gz /storage/gge/Joan/fastq_memoria/trimmed_reads/SRR9929281_2.fastq.gz"
+}

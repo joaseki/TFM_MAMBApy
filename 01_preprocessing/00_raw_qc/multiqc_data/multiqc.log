@@ -1,0 +1,2 @@
+[2025-03-13 13:30:19,588] multiqc.core.file_search                           [INFO   ]  Search path: /storage/gge/Joan/fastq_memoria/fastqc_reports
+[2025-03-13 13:30:22,289] multiqc.modules.fastqc.fastqc                      [INFO   ]  Found 48 reports
