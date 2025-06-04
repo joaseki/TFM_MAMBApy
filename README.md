@@ -36,7 +36,7 @@ This repository contains all scripts and outputs used in the master's thesis pro
 
 - Python ≥ 3.8 with `cobra`, `pandas`, `numpy`, `scikit-learn`
 - R ≥ 4.2 with `DESeq2`, `clusterProfiler`, `GSVA`, `ComplexHeatmap`
-- MAMBApy: [https://github.com/ConesaLab/MAMBApy](https://github.com/ConesaLab/MAMBApy)
+- MAMBApy: [https://github.com/alexpan00/MAMBApy](https://github.com/alexpan00/MAMBApy)
 - Troppo (for benchmarking): [https://github.com/BioSystemsUM/troppo](https://github.com/BioSystemsUM/troppo)
 
 ##  License
